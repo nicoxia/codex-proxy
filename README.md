@@ -34,28 +34,10 @@
 
   <br><br>
 
-  <table>
-    <tr>
-      <td align="center">
-        <img src="./.github/assets/donate.png" width="180" alt="微信赞赏码"><br>
-        <sub>☕ 赞赏</sub>
-      </td>
-      <td align="center">
-        <img src="./.github/assets/wechat-group.jpg" width="180" alt="微信交流群"><br>
-        <sub>💬 交流群</sub>
-      </td>
-    </tr>
-  </table>
+ 
 
 </div>
 
----
-
-> **声明**：本项目由个人独立开发和维护，初衷是解决自己的需求。我有自己的注册机，根本不缺 token，所以这个项目不是为了"薅"谁的资源而存在的。
->
-> 我自愿开源、自愿维护。该有的功能我会加，有 bug 我也会第一时间修。但我没有义务为任何单个用户提供定制服务。
->
-> 觉得代码垃圾？可以不用。觉得你写得更好？欢迎提 PR 加入贡献者。Issue 区用来反馈 bug 和建议，不是用来提需求、催更新、或指点江山的。
 
 ---
 
