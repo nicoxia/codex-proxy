@@ -26,14 +26,7 @@
     <a href="./README_EN.md">English</a>
   </p>
 
-  <br>
-
-  <a href="https://x.com/IceBearMiner"><img src="https://img.shields.io/badge/Follow-@IceBearMiner-000?style=flat-square&logo=x&logoColor=white" alt="X"></a>
-  <a href="https://github.com/icebear0828/codex-proxy/issues"><img src="https://img.shields.io/github/issues/icebear0828/codex-proxy?style=flat-square" alt="Issues"></a>
-  <a href="#-赞赏--交流"><img src="https://img.shields.io/badge/赞赏-微信-07C160?style=flat-square&logo=wechat&logoColor=white" alt="赞赏"></a>
-
-  <br><br>
-
+ 
  
 
 </div>
@@ -49,11 +42,11 @@
 
 > **前置条件**：你需要一个 ChatGPT 账号（免费账号即可）。如果还没有，先去 [chat.openai.com](https://chat.openai.com) 注册一个。
 
-### 方式一：桌面应用（推荐新手）
+### 方式一：桌面应用（暂时没有）
 
 下载 → 安装 → 打开就能用。
 
-**下载安装包** — 打开 [Releases 页面](https://github.com/icebear0828/codex-proxy/releases)，根据系统下载：
+**下载安装包** — 打开 [Releases 页面](嗯)，根据系统下载：
 
 | 系统 | 文件 |
 |------|------|
