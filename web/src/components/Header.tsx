@@ -84,7 +84,7 @@ export function Header({ onAddAccount, onCheckUpdate, onOpenUpdateModal, checkin
             </div>
             {/* Star on GitHub */}
             <a
-              href="https://github.com/icebear0828/codex-proxy"
+              href="https://github.com/nicoxia/codex-proxy"
               target="_blank"
               rel="noopener noreferrer"
               class="hidden lg:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700 dark:bg-amber-900/20 dark:border-amber-700/30 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors"

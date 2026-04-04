@@ -3,7 +3,7 @@
  *
  * Team accounts share the same chatgpt_account_id but have distinct
  * chatgpt_user_id values. They should be treated as separate accounts.
- * See: https://github.com/icebear0828/codex-proxy/issues/126
+ * See: https://github.com/nicoxia/codex-proxy/issues/126
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";

@@ -1,6 +1,6 @@
 /**
  * Tests that /v1/responses works without the `instructions` field.
- * Regression test for: https://github.com/icebear0828/codex-proxy/issues/71
+ * Regression test for: https://github.com/nicoxia/codex-proxy/issues/71
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";

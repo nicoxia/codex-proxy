@@ -77,7 +77,7 @@ function hardRestart(cwd: string): void {
 
 const execFileAsync = promisify(execFile);
 
-const GITHUB_REPO = "icebear0828/codex-proxy";
+const GITHUB_REPO = "nicoxia/codex-proxy";
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const INITIAL_DELAY_MS = 10_000; // 10 seconds after startup
 
