@@ -30,7 +30,7 @@
     "postinstall": "tsx scripts/infra/setup-curl.ts"
   },
   "dependencies": {
-    "@hono/node-server": "^1.0.0",
+    "@hono/node-server": "^1.13.0",
     "hono": "^4.0.0",
     "https-proxy-agent": "^8.0.0",
     "js-yaml": "^4.1.0",

@@ -30,6 +30,8 @@ import { startQuotaRefresh, stopQuotaRefresh } from "./auth/usage-refresher.js";
 import { UsageStatsStore } from "./auth/usage-stats.js";
 import { startSessionCleanup, stopSessionCleanup } from "./auth/dashboard-session.js";
 import { createDashboardAuthRoutes } from "./routes/dashboard-login.js";
+import { attachWebSocketServer } from "./ws/responses-ws.js";
+import type { WsServerHandle } from "./ws/responses-ws.js";
 
 export interface ServerHandle {
   close: () => Promise<void>;
@@ -160,8 +162,14 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   const addr = server.address();
   const actualPort = (addr && typeof addr === "object") ? addr.port : port;
 
+  // ── WebSocket server ──────────────────────────────────────────────
+  // Attach WS endpoint for Codex CLI (after server starts and has address)
+  // Cast needed because serve() returns ServerType (http | http2), but we always use http
+  const wsHandle = attachWebSocketServer(server as import("http").Server, accountPool, cookieJar, proxyPool);
+
   const close = (): Promise<void> => {
     return new Promise((resolve) => {
+      wsHandle.close();
       server.close(() => {
         stopUpdateChecker();
         stopProxyUpdateChecker();
