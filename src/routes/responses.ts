@@ -6,7 +6,7 @@
  * retry logic, and usage tracking via the shared proxy handler.
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import type { AccountPool } from "../auth/account-pool.js";
 import type { CookieJar } from "../proxy/cookie-jar.js";
 import type { ProxyPool } from "../proxy/proxy-pool.js";
@@ -112,7 +112,7 @@ async function* streamPassthrough(
 
 // ── Passthrough collect translator ─────────────────────────────────
 
-async function collectPassthrough(
+export async function collectPassthrough(
   api: CodexApi,
   response: Response,
   _model: string,
@@ -126,32 +126,39 @@ async function collectPassthrough(
   let usage = { input_tokens: 0, output_tokens: 0 };
   let responseId: string | null = null;
 
-  for await (const raw of api.parseStream(response)) {
-    const data = raw.data;
-    if (!isRecord(data)) continue;
-    const resp = isRecord(data.response) ? data.response : null;
+  try {
+    for await (const raw of api.parseStream(response)) {
+      const data = raw.data;
+      if (!isRecord(data)) continue;
+      const resp = isRecord(data.response) ? data.response : null;
 
-    if (raw.event === "response.created" || raw.event === "response.in_progress") {
-      if (resp && typeof resp.id === "string") responseId = resp.id;
-    }
+      if (raw.event === "response.created" || raw.event === "response.in_progress") {
+        if (resp && typeof resp.id === "string") responseId = resp.id;
+      }
 
-    if (raw.event === "response.completed" && resp) {
-      finalResponse = resp;
-      if (typeof resp.id === "string") responseId = resp.id;
-      if (isRecord(resp.usage)) {
-        usage = {
-          input_tokens: typeof resp.usage.input_tokens === "number" ? resp.usage.input_tokens : 0,
-          output_tokens: typeof resp.usage.output_tokens === "number" ? resp.usage.output_tokens : 0,
-        };
+      if (raw.event === "response.completed" && resp) {
+        finalResponse = resp;
+        if (typeof resp.id === "string") responseId = resp.id;
+        if (isRecord(resp.usage)) {
+          usage = {
+            input_tokens: typeof resp.usage.input_tokens === "number" ? resp.usage.input_tokens : 0,
+            output_tokens: typeof resp.usage.output_tokens === "number" ? resp.usage.output_tokens : 0,
+          };
+        }
+      }
+
+      if (raw.event === "error" || raw.event === "response.failed") {
+        const err = isRecord(data.error) ? data.error : data;
+        throw new Error(
+          `Codex API error: ${typeof err.code === "string" ? err.code : "unknown"}: ${typeof err.message === "string" ? err.message : JSON.stringify(data)}`,
+        );
       }
     }
-
-    if (raw.event === "error" || raw.event === "response.failed") {
-      const err = isRecord(data.error) ? data.error : data;
-      throw new Error(
-        `Codex API error: ${typeof err.code === "string" ? err.code : "unknown"}: ${typeof err.message === "string" ? err.message : JSON.stringify(data)}`,
-      );
+  } catch (streamErr) {
+    if (!finalResponse) {
+      throw new EmptyResponseError(responseId, usage);
     }
+    throw streamErr;
   }
 
   if (!finalResponse) {
@@ -226,7 +233,7 @@ export function createResponsesRoutes(
 ): Hono {
   const app = new Hono();
 
-  app.post("/v1/responses", async (c) => {
+  const handler = (compact: boolean) => async (c: Context) => {
     // Auth check
     if (!accountPool.isAuthenticated()) {
       c.status(401);
@@ -304,9 +311,11 @@ export function createResponsesRoutes(
       store: false,
     };
 
-    // Responses API always uses WebSocket transport — enables server-side storage
-    // and previous_response_id for multi-turn conversations.
-    codexRequest.useWebSocket = true;
+    // Compact uses HTTP SSE only (no WebSocket path for /responses/compact).
+    // Regular responses use WebSocket to enable previous_response_id and server-side storage.
+    if (!compact) {
+      codexRequest.useWebSocket = true;
+    }
     if (typeof body.previous_response_id === "string") {
       codexRequest.previous_response_id = body.previous_response_id;
     }
@@ -370,6 +379,8 @@ export function createResponsesRoutes(
       };
     }
 
+    if (compact) codexRequest.compact = true;
+
     // Client can request non-streaming (collect mode), but upstream is always stream
     const clientWantsStream = body.stream !== false;
 
@@ -386,7 +397,10 @@ export function createResponsesRoutes(
       PASSTHROUGH_FORMAT,
       proxyPool,
     );
-  });
+  };
+
+  app.post("/v1/responses", handler(false));
+  app.post("/v1/responses/compact", handler(true));
 
   return app;
 }
