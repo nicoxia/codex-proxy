@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
+import { extractErrorMessage } from "../utils/extract-error";
 
 export interface GeneralSettingsData {
   port: number;
@@ -7,12 +8,16 @@ export interface GeneralSettingsData {
   inject_desktop_context: boolean;
   suppress_desktop_directives: boolean;
   default_model: string;
-  default_reasoning_effort: string;
+  default_reasoning_effort: string | null;
   refresh_enabled: boolean;
   refresh_margin_seconds: number;
   refresh_concurrency: number;
   auto_update: boolean;
   auto_download: boolean;
+  logs_enabled: boolean;
+  logs_capacity: number;
+  logs_capture_body: boolean;
+  logs_llm_only: boolean;
 }
 
 interface GeneralSettingsSaveResponse extends GeneralSettingsData {
@@ -54,8 +59,8 @@ export function useGeneralSettings(apiKey: string | null) {
         body: JSON.stringify(patch),
       });
       if (!resp.ok) {
-        const body = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
-        throw new Error((body as { error?: string }).error ?? `HTTP ${resp.status}`);
+        const body = await resp.json().catch(() => null);
+        throw new Error(extractErrorMessage(body, `HTTP ${resp.status}`));
       }
       const result = await resp.json() as GeneralSettingsSaveResponse;
       setData({
@@ -71,6 +76,10 @@ export function useGeneralSettings(apiKey: string | null) {
         refresh_concurrency: result.refresh_concurrency,
         auto_update: result.auto_update,
         auto_download: result.auto_download,
+        logs_enabled: result.logs_enabled,
+        logs_capacity: result.logs_capacity,
+        logs_capture_body: result.logs_capture_body,
+        logs_llm_only: result.logs_llm_only,
       });
       setRestartRequired(result.restart_required);
       setSaved(true);

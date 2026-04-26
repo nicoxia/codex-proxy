@@ -22,6 +22,7 @@ import type {
 export class AccountPool {
   private registry: AccountRegistry;
   private lifecycle: AccountLifecycle;
+  private _onExpired?: (entryId: string) => void;
 
   constructor(options?: {
     persistence?: AccountPersistence;
@@ -79,6 +80,11 @@ export class AccountPool {
     this.lifecycle.releaseWithoutCounting(entryId);
   }
 
+  /** Fast check: is there at least one active account not in the exclude list? */
+  hasAvailableAccounts(excludeIds?: string[]): boolean {
+    return this.registry.hasAvailableAccounts(excludeIds);
+  }
+
   setRotationStrategy(name: "least_used" | "round_robin" | "sticky"): void {
     this.lifecycle.setRotationStrategy(name);
   }
@@ -113,9 +119,17 @@ export class AccountPool {
 
   // ── Status mutations (coordinate registry + lifecycle lock clear) ─
 
+  /** Register a callback invoked when an account is marked "expired" (e.g. 401 from upstream). */
+  onExpired(cb: (entryId: string) => void): void {
+    this._onExpired = cb;
+  }
+
   markStatus(entryId: string, status: AccountEntry["status"]): void {
     if (this.registry.markStatus(entryId, status)) {
       this.lifecycle.clearLock(entryId);
+    }
+    if (status === "expired" && this._onExpired) {
+      this._onExpired(entryId);
     }
   }
 

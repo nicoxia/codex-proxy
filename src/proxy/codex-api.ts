@@ -6,7 +6,7 @@
  * It requires: instructions, store: false, stream: true.
  *
  * All upstream requests go through the TLS transport layer
- * (native rustls, curl CLI, or libcurl FFI).
+ * (native rustls transport).
  */
 
 import { getConfig } from "../config.js";
@@ -26,6 +26,8 @@ import type { BackendModelEntry } from "../models/model-store.js";
 // Re-export types from codex-types.ts for backward compatibility
 export type {
   CodexResponsesRequest,
+  CodexCompactRequest,
+  CodexCompactResponse,
   CodexContentPart,
   CodexInputItem,
   CodexSSEEvent,
@@ -39,12 +41,17 @@ export { parseSSEBlock, parseSSEStream } from "./codex-sse.js";
 
 import {
   CodexApiError,
+  PreviousResponseWebSocketError,
   type CodexResponsesRequest,
+  type CodexCompactRequest,
+  type CodexCompactResponse,
   type CodexSSEEvent,
   type CodexUsageResponse,
 } from "./codex-types.js";
 
 export class CodexApi {
+  readonly tag = "codex" as const;
+
   private token: string;
   private accountId: string | null;
   private cookieJar: CookieJar | null;
@@ -161,7 +168,7 @@ export class CodexApi {
   /**
    * Create a response (streaming).
    * Routes to WebSocket when previous_response_id is present (HTTP SSE doesn't support it).
-   * Falls back to HTTP SSE if WebSocket fails.
+   * 仅当不依赖 previous_response_id 时，WebSocket 失败后才降级到 HTTP SSE。
    */
   async createResponse(
     request: CodexResponsesRequest,
@@ -173,6 +180,12 @@ export class CodexApi {
         return await this.createResponseViaWebSocket(request, signal, onRateLimits);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (request.previous_response_id) {
+          console.warn(
+            `[CodexApi] WebSocket 失败（${msg}），previous_response_id 不能安全降级到 HTTP SSE`,
+          );
+          throw new PreviousResponseWebSocketError(msg);
+        }
         console.warn(`[CodexApi] WebSocket failed (${msg}), falling back to HTTP SSE`);
         const { previous_response_id: _, useWebSocket: _ws, ...httpRequest } = request;
         return this.createResponseViaHttp(httpRequest as CodexResponsesRequest, signal);
@@ -232,8 +245,7 @@ export class CodexApi {
   ): Promise<Response> {
     const transport = this.resolveTransport();
     const baseUrl = this.resolveBaseUrl();
-    const path = request.compact ? "/codex/responses/compact" : "/codex/responses";
-    const url = `${baseUrl}${path}`;
+    const url = `${baseUrl}/codex/responses`;
 
     const headers = this.applyHeaders(
       buildHeadersWithContentType(this.token, this.accountId),
@@ -244,7 +256,7 @@ export class CodexApi {
     headers["x-client-request-id"] = crypto.randomUUID();
     if (request.turnState) headers["x-codex-turn-state"] = request.turnState;
 
-    const { previous_response_id: _pid, useWebSocket: _ws, turnState: _ts, service_tier: _st, compact: _c, ...bodyFields } = request;
+    const { previous_response_id: _pid, useWebSocket: _ws, turnState: _ts, service_tier: _st, ...bodyFields } = request;
     const body = JSON.stringify(bodyFields);
 
     let transportRes;
@@ -288,6 +300,60 @@ export class CodexApi {
   }
 
   /**
+   * Compact conversation history (non-streaming JSON).
+   * POST /codex/responses/compact → { output: ResponseItem[] }.
+   * codex-rs uses this for server-side context compaction (session.execute, not stream).
+   */
+  async createCompactResponse(
+    request: CodexCompactRequest,
+    signal?: AbortSignal,
+  ): Promise<CodexCompactResponse> {
+    const transport = this.resolveTransport();
+    const baseUrl = this.resolveBaseUrl();
+    const url = `${baseUrl}/codex/responses/compact`;
+
+    const headers = this.applyHeaders(
+      buildHeadersWithContentType(this.token, this.accountId),
+    );
+    // No "Accept: text/event-stream" — compact returns plain JSON
+    headers["OpenAI-Beta"] = "responses_websockets=2026-02-06";
+    headers["x-openai-internal-codex-residency"] = "us";
+    headers["x-client-request-id"] = crypto.randomUUID();
+
+    const body = JSON.stringify(request);
+
+    let transportRes;
+    try {
+      transportRes = await transport.post(url, headers, body, signal, undefined, this.proxyUrl);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new CodexApiError(0, msg);
+    }
+
+    this.captureCookies(transportRes.setCookieHeaders);
+
+    // Read the full response body (non-streaming)
+    const reader = transportRes.body.getReader();
+    const chunks: Uint8Array[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    const responseBody = Buffer.concat(chunks).toString("utf-8");
+
+    if (transportRes.status < 200 || transportRes.status >= 300) {
+      throw new CodexApiError(transportRes.status, responseBody);
+    }
+
+    try {
+      return JSON.parse(responseBody) as CodexCompactResponse;
+    } catch {
+      throw new CodexApiError(502, `Compact response is not valid JSON: ${responseBody.slice(0, 200)}`);
+    }
+  }
+
+  /**
    * Parse SSE stream from a Codex Responses API response.
    * Delegates to the standalone parseSSEStream() function.
    */
@@ -297,4 +363,4 @@ export class CodexApi {
 }
 
 // Re-export CodexApiError for backward compatibility
-export { CodexApiError } from "./codex-types.js";
+export { CodexApiError, PreviousResponseWebSocketError } from "./codex-types.js";

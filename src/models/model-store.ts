@@ -28,6 +28,8 @@ export interface CodexModelInfo {
   supportedReasoningEfforts: { reasoningEffort: string; description: string }[];
   defaultReasoningEffort: string;
   inputModalities: string[];
+  /** Output content types. Defaults to ['text'] when absent (chat models). */
+  outputModalities?: string[];
   supportsPersonality: boolean;
   upgrade: string | null;
   /** Where this model entry came from */
@@ -62,6 +64,7 @@ export interface BackendModelEntry {
     description?: string;
   }>;
   input_modalities?: string[];
+  output_modalities?: string[];
   supports_personality?: boolean;
   upgrade?: string | null;
   prefer_websockets?: boolean;
@@ -86,6 +89,34 @@ interface NormalizedModelWithMeta extends CodexModelInfo {
 
 const SERVICE_TIER_SUFFIXES = new Set(["fast", "flex"]);
 const EFFORT_SUFFIXES = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
+function stripKnownModelSuffixes(input: string): {
+  modelName: string;
+  serviceTier: string | null;
+  reasoningEffort: string | null;
+} {
+  let remaining = input.trim();
+  let serviceTier: string | null = null;
+  let reasoningEffort: string | null = null;
+
+  for (const tier of SERVICE_TIER_SUFFIXES) {
+    if (remaining.endsWith(`-${tier}`)) {
+      serviceTier = tier;
+      remaining = remaining.slice(0, -(tier.length + 1));
+      break;
+    }
+  }
+
+  for (const effort of EFFORT_SUFFIXES) {
+    if (remaining.endsWith(`-${effort}`)) {
+      reasoningEffort = effort;
+      remaining = remaining.slice(0, -(effort.length + 1));
+      break;
+    }
+  }
+
+  return { modelName: remaining, serviceTier, reasoningEffort };
+}
 
 // ── Class ────────────────────────────────────────────────────────────
 
@@ -161,6 +192,10 @@ export class ModelStore {
           supportedReasoningEfforts: _hasExplicitEfforts
             ? model.supportedReasoningEfforts
             : existing.supportedReasoningEfforts,
+          // Preserve static isDefault when backend doesn't explicitly mark a default.
+          // Codex backend typically omits is_default for non-flagship models, which
+          // would otherwise clobber our YAML-declared default to false.
+          isDefault: raw.is_default === true ? true : existing.isDefault,
           source: "backend",
         });
       } else {
@@ -225,6 +260,26 @@ export class ModelStore {
     return this.defaultModelFn();
   }
 
+  isRecognizedModelName(input: string): boolean {
+    const trimmed = input.trim();
+    if (!trimmed) return false;
+
+    if (this.aliases[trimmed] || this.catalog.some((m) => m.id === trimmed)) {
+      return true;
+    }
+
+    const stripped = stripKnownModelSuffixes(trimmed);
+    if (
+      stripped.modelName === trimmed
+      || (!stripped.serviceTier && !stripped.reasoningEffort)
+    ) {
+      return false;
+    }
+
+    return !!this.aliases[stripped.modelName]
+      || this.catalog.some((m) => m.id === stripped.modelName);
+  }
+
   parseModelName(input: string): ParsedModelName {
     const trimmed = input.trim();
 
@@ -232,27 +287,9 @@ export class ModelStore {
       return { modelId: this.resolveModelId(trimmed), serviceTier: null, reasoningEffort: null };
     }
 
-    let remaining = trimmed;
-    let serviceTier: string | null = null;
-    let reasoningEffort: string | null = null;
-
-    for (const tier of SERVICE_TIER_SUFFIXES) {
-      if (remaining.endsWith(`-${tier}`)) {
-        serviceTier = tier;
-        remaining = remaining.slice(0, -(tier.length + 1));
-        break;
-      }
-    }
-
-    for (const effort of EFFORT_SUFFIXES) {
-      if (remaining.endsWith(`-${effort}`)) {
-        reasoningEffort = effort;
-        remaining = remaining.slice(0, -(effort.length + 1));
-        break;
-      }
-    }
-
-    const modelId = this.resolveModelId(remaining);
+    const stripped = stripKnownModelSuffixes(trimmed);
+    const modelId = this.resolveModelId(stripped.modelName);
+    const { serviceTier, reasoningEffort } = stripped;
     return { modelId, serviceTier, reasoningEffort };
   }
 
@@ -359,7 +396,7 @@ function normalizeBackendModel(raw: BackendModelEntry): NormalizedModelWithMeta 
         description: e.description ?? "",
       }));
 
-  return {
+  const out: NormalizedModelWithMeta = {
     id,
     displayName: raw.display_name ?? raw.name ?? id,
     description: raw.description ?? "",
@@ -374,6 +411,10 @@ function normalizeBackendModel(raw: BackendModelEntry): NormalizedModelWithMeta 
     source: "backend",
     _hasExplicitEfforts: hasExplicitEfforts,
   };
+  // Only set outputModalities when backend provided it — otherwise the spread
+  // in applyBackendModels would clobber the static catalog value with undefined.
+  if (raw.output_modalities) out.outputModalities = raw.output_modalities;
+  return out;
 }
 
 // ── Default instance + backward-compatible free functions ─────────
@@ -420,6 +461,10 @@ export function isPlanFetched(planType: string): boolean {
 
 export function resolveModelId(input: string): string {
   return _instance.resolveModelId(input);
+}
+
+export function isRecognizedModelName(input: string): boolean {
+  return _instance.isRecognizedModelName(input);
 }
 
 export function parseModelName(input: string): ParsedModelName {

@@ -44,7 +44,7 @@
 
 ---
 
-**Codex Proxy** is a lightweight local gateway that translates the [Codex Desktop](https://openai.com/codex) Responses API into multiple standard protocol endpoints — OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, Gemini, and Codex `/v1/responses` passthrough. Use Codex coding models directly in Cursor, Claude Code, Continue, or any compatible client.
+**Codex Proxy** is a lightweight local gateway that translates the [Codex Desktop](https://openai.com/codex) Responses API into multiple standard protocol endpoints — OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, Gemini, Codex `/v1/responses` passthrough, and an optional Ollama-compatible `/api/chat` bridge. Use Codex coding models directly in Cursor, Claude Code, Continue, or any compatible client.
 
 Just a ChatGPT account (or a third-party API relay) and this proxy — your own personal AI coding assistant gateway, running locally.
 
@@ -73,37 +73,50 @@ docker compose up -d
 # Open http://localhost:8080 to log in
 ```
 
-> Data persists in `data/`. Cross-container access: use host LAN IP (e.g. `192.168.x.x:8080`), not `localhost`. Uncomment Watchtower in `docker-compose.yml` for auto-updates.
+> Data persists in `data/`. Cross-container access: use host LAN IP (e.g. `192.168.x.x:8080`), not `localhost`. Uncomment Watchtower in `docker-compose.yml` for auto-updates. To enable the Ollama-compatible bridge in Docker, see [Ollama Bridge configuration](#ollama-bridge-configuration).
 
 ### From Source
 
 ```bash
 git clone https://github.com/icebear0828/codex-proxy.git
 cd codex-proxy
-npm install                        # Backend deps + auto-download curl-impersonate
-cd web && npm install && cd ..     # Frontend deps
+npm install                        # Backend dependencies
+cd web && npm install && cd ..     # Frontend dependencies
 npm run dev                        # Dev mode (hot reload)
 # Or: npm run build && npm start   # Production mode
 ```
 
-> On Windows, curl-impersonate is not available. Falls back to system curl.
+> **Requires Rust toolchain** (for TLS native addon):
+> ```bash
+> curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+> cd native && npm install && npm run build && cd ..
+> ```
+> Docker / desktop app ship pre-built addons — no manual compilation needed.
 
 ### Verify
 
+After logging in, open the dashboard at `http://localhost:8080` and find your API Key in the **API Configuration** section:
+
 ```bash
+# Replace your-api-key with the key shown in the dashboard
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"codex","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+  -H "Authorization: Bearer your-api-key" \
+  -d '{"model":"gpt-5.4","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
 ```
+
+If you see streaming AI text, the setup is working. If you get 401, double-check the API Key.
 
 ## 🌟 Features
 
 ### 1. 🔌 Full Protocol Compatibility
 - Compatible with `/v1/chat/completions` (OpenAI), `/v1/messages` (Anthropic), Gemini, and `/v1/responses` (Codex passthrough)
+- Optional built-in Ollama-compatible bridge, defaulting to `http://127.0.0.1:11434`
 - SSE streaming, works with all OpenAI / Anthropic SDKs and clients
 - Automatic bidirectional translation between all protocols and Codex Responses API
 - **Structured Outputs** — `response_format` (`json_object` / `json_schema`) and Gemini `responseMimeType`
 - **Function Calling** — native `function_call` / `tool_calls` across all protocols
+- If using custom API Keys, only the OpenAI (`/v1/chat/completions`) format is supported.
 
 ### 2. 🔐 Account Management & Smart Rotation
 - **OAuth PKCE login** — one-click browser auth
@@ -122,9 +135,8 @@ curl http://localhost:8080/v1/chat/completions \
 - **Auto-mark unreachable** — unreachable proxies excluded from rotation
 
 ### 4. 🛡️ Anti-Detection & Protocol Impersonation
-- **Chrome TLS fingerprint** — curl-impersonate replicates the full Chrome TLS handshake
-- **Desktop header replication** — `originator`, `User-Agent`, `sec-ch-*` headers in exact Codex Desktop order
-- **Desktop context injection** — optional system prompt injection (off by default, enable via `model.inject_desktop_context`)
+- **Rust Native TLS** — built-in reqwest + rustls native addon, TLS fingerprint matches real Codex Desktop exactly (pinned dependency versions)
+- **Desktop header replication** — `originator`, `User-Agent`, `x-openai-internal-codex-residency`, `x-codex-turn-state`, `x-client-request-id` headers sent per real client behavior
 - **Cookie persistence** — automatic Cloudflare cookie capture and replay
 - **Fingerprint auto-update** — polls Codex Desktop update feed, auto-syncs `app_version` and `build_number`
 
@@ -144,7 +156,7 @@ curl http://localhost:8080/v1/chat/completions \
 │       ▼                                                  │
 │  ┌──────────┐    ┌───────────────┐    ┌──────────────┐   │
 │  │  Routes   │──▶│  Translation  │──▶│    Proxy     │   │
-│  │  (Hono)  │   │ Multi→Codex   │   │ curl TLS/FFI │   │
+│  │  (Hono)  │   │ Multi→Codex   │   │ Native TLS   │   │
 │  └──────────┘   └───────────────┘   └──────┬───────┘   │
 │       ▲                                     │           │
 │       │          ┌───────────────┐          │           │
@@ -154,14 +166,15 @@ curl http://localhost:8080/v1/chat/completions \
 │                                                          │
 │  ┌──────────┐  ┌───────────────┐  ┌──────────────────┐  │
 │  │   Auth   │  │  Fingerprint  │  │   Model Store    │  │
-│  │ OAuth/JWT│  │Chrome TLS/UA  │  │ Static + Dynamic │  │
-│  │  Relay   │  │   Cookie      │  │  Plan Routing    │  │
+│  │ OAuth/JWT│  │ Rust (rustls) │  │ Static + Dynamic │  │
+│  │  Relay   │  │  Headers/UA   │  │  Plan Routing    │  │
 │  └──────────┘  └───────────────┘  └──────────────────┘  │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
                           │
-                  curl-impersonate / FFI
-                   (Chrome TLS fingerprint)
+              Rust Native Addon (napi-rs)
+            reqwest 0.12.28 + rustls 0.23.36
+           (TLS fingerprint = real Codex Desktop)
                           │
                    ┌──────┴──────┐
                    ▼             ▼
@@ -171,43 +184,65 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 📦 Available Models
 
-| Model ID | Alias | Reasoning Efforts | Description |
-|----------|-------|-------------------|-------------|
-| `gpt-5.4` | — | low / medium / high / xhigh | Latest flagship model |
-| `gpt-5.4-mini` | — | low / medium / high / xhigh | 5.4 lightweight version |
-| `gpt-5.3-codex` | — | low / medium / high / xhigh | 5.3 coding-optimized model |
-| `gpt-5.2-codex` | `codex` | low / medium / high / xhigh | Frontier agentic coding model (default) |
-| `gpt-5.2` | — | low / medium / high / xhigh | Professional work & long-running agents |
-| `gpt-5.1-codex-max` | — | low / medium / high / xhigh | Extended context / deepest reasoning |
-| `gpt-5.1-codex` | — | low / medium / high | GPT-5.1 coding model |
-| `gpt-5.1` | — | low / medium / high | General-purpose GPT-5.1 |
-| `gpt-5-codex` | — | low / medium / high | GPT-5 coding model |
-| `gpt-5` | — | minimal / low / medium / high | General-purpose GPT-5 |
-| `gpt-oss-120b` | — | low / medium / high | Open-source 120B model |
-| `gpt-oss-20b` | — | low / medium / high | Open-source 20B model |
-| `gpt-5.1-codex-mini` | — | medium / high | Lightweight, fast coding model |
-| `gpt-5-codex-mini` | — | medium / high | Lightweight coding model |
+| Model ID | Reasoning | Output | Description |
+|----------|-----------|--------|-------------|
+| `gpt-5.5` | low / medium / high / xhigh | text | General-purpose flagship (Plus+) |
+| `gpt-5.4` | low / medium / high / xhigh | text | Latest flagship (default) |
+| `gpt-5.4-mini` | low / medium / high / xhigh | text | 5.4 lightweight version |
+| `gpt-5.3-codex` | low / medium / high / xhigh | text | 5.3 coding-optimized model |
+| `gpt-5.2` | low / medium / high / xhigh | text | Professional work & long-running agents |
+| `gpt-5-codex` | low / medium / high | text | GPT-5 coding model |
+| `gpt-5-codex-mini` | medium / high | text | Lightweight coding model |
+| `gpt-oss-120b` | low / medium / high | text | Open-source 120B model |
+| `gpt-oss-20b` | low / medium / high | text | Open-source 20B model |
+| `gpt-image-2` | — | image | Image-generation backend (Plus+, invoked via the `image_generation` tool) |
 
-> **Suffixes**: Append `-fast` for Fast mode, `-high`/`-low` for reasoning effort. E.g. `codex-fast`, `gpt-5.2-codex-high-fast`.
+> **Suffixes**: Append `-fast` to any chat model for Fast mode, `-high`/`-low` for reasoning effort. E.g. `gpt-5.4-fast`, `gpt-5.4-high-fast`. The image model (`gpt-image-2`) does not take suffixes.
 >
 > **Plan Routing**: Accounts on different plans auto-route to their supported models. Models are dynamically fetched and auto-synced.
+>
+> **Dashboard model picker ≠ config file**: Changing the model in the Dashboard only affects the UI display and API examples — it does **not** modify `model.default` in `config/default.yaml` or `data/local.yaml`. The actual model used is determined by the `model` field in each client request (Cursor, Claude Code, etc.). The `model.default` config is only a fallback when the client omits the model field.
+
+### 🖼️ Image Generation
+
+Image generation rides on `/v1/responses` via the built-in `image_generation` tool; the backend is always `gpt-image-2`.
+
+**Prerequisite**: a **ChatGPT Plus or higher** account (free accounts have the tool silently stripped by upstream, and the model falls back to replying with an SVG snippet).
+
+```bash
+curl -N http://localhost:8080/v1/responses \
+  -H "Authorization: Bearer $PROXY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.5",
+    "stream": true,
+    "input": [{"role":"user","content":"Draw a red circle on white background."}],
+    "tools": [{"type":"image_generation","size":"3840x2160"}]
+  }'
+```
+
+Tunable fields: `size` (1024×1024 / 1024×1536 / 1536×1024 / 2048×2048 / 2048×3072 / 3072×2048 / 3840×2160 (4K UHD) / `auto`; longest edge ≤ 3840 px, pixel budget ≈ 8 MP), `output_format` (`png` / `jpeg` / `webp`), `output_compression` (jpeg / webp only), `background` (`auto` / `opaque`), `moderation` (`auto` / `low`), `partial_images` (0–3). Upstream forces `model = gpt-image-2` and rejects `n`, `input_image`, `mask`, `input_fidelity`, `style`, `response_format`. See [API.md](./API.md#image_generation-tool) for the full matrix.
+
+In the stream, the `image_generation_call` item's `result` field is a base64-encoded image; `revised_prompt` contains the final prompt used by the model.
+
+**Edit mode** (with a reference image): include `{"type":"input_image","image_url":"data:image/png;base64,..."}` in the user message `content` array.
 
 ## 🔗 Client Setup
 
-> Get your API Key from the dashboard (`http://localhost:8080`). Use `codex` (default gpt-5.2-codex) or any [model ID](#-available-models) as the model name.
+> Get your API Key from the dashboard (`http://localhost:8080`). Use a concrete model ID (default `gpt-5.4`) or any [model ID](#-available-models) as the model name.
 
 ### Claude Code (CLI)
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8080
 export ANTHROPIC_API_KEY=your-api-key
-# Switch model: export ANTHROPIC_MODEL=codex-fast / gpt-5.4 / gpt-5.1-codex-mini ...
+# Switch model: export ANTHROPIC_MODEL=gpt-5.4 / gpt-5.4-fast / gpt-5.4-mini ...
 claude
 ```
 
 > Copy env vars from the **Anthropic SDK Setup** card in the dashboard (includes Opus / Sonnet / Haiku tier model config).
 >
-> Recommended models: Opus → `gpt-5.4`, Sonnet → `gpt-5.4-mini`, Haiku → `gpt-5.3-codex`.
+> Recommended models: Opus → `gpt-5.4`, Sonnet → `gpt-5.3-codex`, Haiku → `gpt-5.4-mini`.
 
 ### Codex CLI
 
@@ -241,14 +276,14 @@ Open Claude extension settings → **API Configuration**:
 1. Settings → Models → OpenAI API
 2. **Base URL**: `http://localhost:8080/v1`
 3. **API Key**: your API key
-4. Add model `codex`
+4. Add model `gpt-5.4`
 
 ### Windsurf
 
 1. Settings → AI Provider → **OpenAI Compatible**
 2. **API Base URL**: `http://localhost:8080/v1`
 3. **API Key**: your API key
-4. **Model**: `codex`
+4. **Model**: `gpt-5.4`
 
 ### Cline (VSCode Extension)
 
@@ -256,7 +291,7 @@ Open Claude extension settings → **API Configuration**:
 2. **API Provider**: OpenAI Compatible
 3. **Base URL**: `http://localhost:8080/v1`
 4. **API Key**: your API key
-5. **Model ID**: `codex`
+5. **Model ID**: `gpt-5.4`
 
 ### Continue (VSCode Extension)
 
@@ -266,7 +301,7 @@ Open Claude extension settings → **API Configuration**:
   "models": [{
     "title": "Codex",
     "provider": "openai",
-    "model": "codex",
+    "model": "gpt-5.4",
     "apiBase": "http://localhost:8080/v1",
     "apiKey": "your-api-key"
   }]
@@ -278,7 +313,7 @@ Open Claude extension settings → **API Configuration**:
 ```bash
 aider --openai-api-base http://localhost:8080/v1 \
       --openai-api-key your-api-key \
-      --model openai/codex
+      --model openai/gpt-5.4
 ```
 
 ### Cherry Studio
@@ -287,7 +322,27 @@ aider --openai-api-base http://localhost:8080/v1 \
 2. **Type**: OpenAI
 3. **API URL**: `http://localhost:8080/v1`
 4. **API Key**: your API key
-5. Add model `codex`
+5. Add model `gpt-5.4`
+
+### Ollama-Compatible Clients
+
+Enable it in Dashboard → Settings → **Ollama Bridge**, then use the default Ollama base URL:
+
+| Setting | Value |
+|---------|-------|
+| Base URL | `http://localhost:11434` |
+| API Key | Not required; the bridge uses the Codex Proxy key internally |
+| Model | `gpt-5.4` (or any model ID) |
+
+```bash
+curl http://localhost:11434/api/tags
+
+curl http://localhost:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-5.4","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+```
+
+> The Ollama API has no authentication. The bridge listens on `127.0.0.1` by default; do not expose it to the public internet or untrusted LANs.
 
 ### Any OpenAI-Compatible Client
 
@@ -295,7 +350,7 @@ aider --openai-api-base http://localhost:8080/v1 \
 |---------|-------|
 | Base URL | `http://localhost:8080/v1` |
 | API Key | from dashboard |
-| Model | `codex` (or any model ID) |
+| Model | `gpt-5.4` (or any model ID) |
 
 <details>
 <summary>SDK examples (Python / Node.js)</summary>
@@ -305,7 +360,7 @@ aider --openai-api-base http://localhost:8080/v1 \
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8080/v1", api_key="your-api-key")
 for chunk in client.chat.completions.create(
-    model="codex", messages=[{"role": "user", "content": "Hello!"}], stream=True
+    model="gpt-5.4", messages=[{"role": "user", "content": "Hello!"}], stream=True
 ):
     print(chunk.choices[0].delta.content or "", end="")
 ```
@@ -315,7 +370,7 @@ for chunk in client.chat.completions.create(
 import OpenAI from "openai";
 const client = new OpenAI({ baseURL: "http://localhost:8080/v1", apiKey: "your-api-key" });
 const stream = await client.chat.completions.create({
-  model: "codex", messages: [{ role: "user", content: "Hello!" }], stream: true,
+  model: "gpt-5.4", messages: [{ role: "user", content: "Hello!" }], stream: true,
 });
 for await (const chunk of stream) {
   process.stdout.write(chunk.choices[0]?.delta?.content || "");
@@ -335,9 +390,39 @@ All configuration in `config/default.yaml`:
 | `client` | `app_version`, `build_number`, `chromium_version` | Codex Desktop version to impersonate |
 | `model` | `default`, `default_reasoning_effort`, `inject_desktop_context` | Default model and reasoning config |
 | `auth` | `rotation_strategy`, `rate_limit_backoff_seconds` | Rotation strategy and rate limit backoff |
-| `tls` | `curl_binary`, `impersonate_profile`, `proxy_url`, `force_http11` | TLS impersonation and proxy |
+| `tls` | `proxy_url`, `force_http11` | TLS proxy and HTTP version |
 | `quota` | `refresh_interval_minutes`, `warning_thresholds`, `skip_exhausted` | Quota refresh and warnings |
 | `session` | `ttl_minutes`, `cleanup_interval_minutes` | Dashboard session management |
+| `ollama` | `enabled`, `host`, `port`, `version`, `disable_vision` | Ollama-compatible bridge |
+
+### Ollama Bridge Configuration
+
+```yaml
+ollama:
+  enabled: false          # true = start the built-in Ollama-compatible listener
+  host: 127.0.0.1         # localhost-only by default
+  port: 11434             # Ollama default port
+  version: "0.18.3"       # value returned by /api/version
+  disable_vision: false   # true = do not advertise vision in /api/show
+```
+
+Supported Ollama endpoints:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `http://localhost:11434/api/version` | GET | Ollama version probe |
+| `http://localhost:11434/api/tags` | GET | Model list |
+| `http://localhost:11434/api/show` | POST | Model metadata |
+| `http://localhost:11434/api/chat` | POST | Chat completions with streaming NDJSON |
+| `http://localhost:11434/v1/*` | Any | OpenAI `/v1` passthrough |
+
+For Docker deployments that need host access to `11434`:
+
+1. Set `ollama.enabled: true` and `ollama.host: 0.0.0.0` in the Dashboard or `data/local.yaml`.
+2. Uncomment the `127.0.0.1:${OLLAMA_BRIDGE_PORT:-11434}:11434` port mapping in `docker-compose.yml`.
+3. Keep the host binding on `127.0.0.1` unless you intentionally want to expose an unauthenticated Ollama API.
+
+Browser CORS access is limited to loopback origins such as `localhost`, `127.x.x.x`, and `::1`; non-local web origins are not allowed to read bridge responses. The bridge injects the configured Codex Proxy API key for `/v1/*` passthrough requests, so exposing it beyond localhost effectively grants unauthenticated access to the main proxy API.
 
 ### Environment Variable Overrides
 
@@ -347,6 +432,11 @@ All configuration in `config/default.yaml`:
 | `CODEX_PLATFORM` | `client.platform` |
 | `CODEX_ARCH` | `client.arch` |
 | `HTTPS_PROXY` | `tls.proxy_url` |
+| `OLLAMA_BRIDGE_ENABLED` | `ollama.enabled` |
+| `OLLAMA_BRIDGE_HOST` | `ollama.host` |
+| `OLLAMA_BRIDGE_PORT` | `ollama.port` |
+| `OLLAMA_BRIDGE_VERSION` | `ollama.version` |
+| `OLLAMA_BRIDGE_DISABLE_VISION` | `ollama.disable_vision` |
 
 ## 📡 API Endpoints
 
@@ -361,6 +451,7 @@ All configuration in `config/default.yaml`:
 | `/v1/responses` | POST | Codex Responses API passthrough |
 | `/v1/messages` | POST | Anthropic format chat completions |
 | `/v1/models` | GET | List available models |
+| `:11434/api/chat` | POST | Ollama-compatible chat completions (requires Ollama Bridge) |
 
 **Auth & Accounts**
 
@@ -368,9 +459,43 @@ All configuration in `config/default.yaml`:
 |----------|--------|-------------|
 | `/auth/login` | GET | OAuth login entry |
 | `/auth/accounts` | GET | Account list (`?quota=true` / `?quota=fresh`) |
+| `/auth/accounts` | POST | Add single account (token or refreshToken) |
+| `/auth/accounts/import` | POST | Bulk import accounts |
+| `/auth/accounts/export` | GET | Export accounts (`?format=minimal` for compact) |
 | `/auth/accounts/relay` | POST | Add relay account |
 | `/auth/accounts/batch-delete` | POST | Batch delete accounts |
 | `/auth/accounts/batch-status` | POST | Batch update account status |
+
+**Account Import/Export Examples**
+
+```bash
+# Export all accounts (full format with tokens)
+curl -s http://localhost:8080/auth/accounts/export \
+  -H "Authorization: Bearer your-api-key" > backup.json
+
+# Export minimal format (refreshToken + label only, safe to share)
+curl -s "http://localhost:8080/auth/accounts/export?format=minimal" \
+  -H "Authorization: Bearer your-api-key" > backup-minimal.json
+
+# Bulk import (token, refreshToken, or both)
+curl -X POST http://localhost:8080/auth/accounts/import \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "accounts": [
+      { "token": "eyJhbGciOi..." },
+      { "refreshToken": "v1.abc..." },
+      { "refreshToken": "v1.def...", "label": "Backup" }
+    ]
+  }'
+# Returns: { "added": 2, "updated": 1, "failed": 0, "errors": [] }
+
+# One-step backup restore (export file → import to another instance)
+curl -X POST http://localhost:8080/auth/accounts/import \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d @backup.json
+```
 
 **Admin**
 
@@ -378,6 +503,8 @@ All configuration in `config/default.yaml`:
 |----------|--------|-------------|
 | `/admin/rotation-settings` | GET/POST | Rotation strategy config |
 | `/admin/quota-settings` | GET/POST | Quota refresh & warning config |
+| `/admin/ollama-settings` | GET/POST | Ollama Bridge config |
+| `/admin/ollama-status` | GET | Ollama Bridge runtime status |
 | `/admin/refresh-models` | POST | Trigger manual model list refresh |
 | `/admin/usage-stats/summary` | GET | Usage stats summary |
 | `/admin/usage-stats/history` | GET | Usage time series |
@@ -398,7 +525,7 @@ All configuration in `config/default.yaml`:
 ## 📋 Requirements
 
 - **Node.js** 18+ (20+ recommended)
-- **curl** — system curl works; `npm install` auto-downloads curl-impersonate
+- **Rust** — required for source builds (compiles TLS native addon); Docker / desktop app ship pre-built
 - **ChatGPT account** — free account is sufficient
 - **Docker** (optional)
 
@@ -406,13 +533,27 @@ All configuration in `config/default.yaml`:
 
 - Codex API is **stream-only**. `stream: false` causes the proxy to stream internally and return assembled JSON.
 - This project relies on Codex Desktop's public API. Upstream updates are auto-detected and fingerprints auto-synced.
-- On Windows, curl-impersonate is unavailable. Falls back to system curl — use Docker or WSL for full TLS impersonation.
+- Windows source builds need Rust toolchain for the TLS native addon. Docker deployment has it pre-built.
 
-## ☕ Donate
+## ☕ Donate & Community
 
 <div align="center">
-  <p>Find this useful? Buy me a coffee!</p>
-  <img src="./.github/assets/donate.png" width="200" alt="WeChat Donate">
+  <table>
+    <tr>
+      <td align="center">
+        <img src="./.github/assets/donate.png" width="180" alt="WeChat Donate"><br>
+        <sub>☕ Donate</sub>
+      </td>
+      <td align="center">
+        <img src="./.github/assets/wechat.png" width="180" alt="WeChat Group"><br>
+        <sub>💬 WeChat</sub>
+      </td>
+      <td align="center">
+        <img src="./.github/assets/tgimage.png" width="180" alt="Telegram Group"><br>
+        <sub>💬 Telegram</sub>
+      </td>
+    </tr>
+  </table>
 </div>
 
 ## 📄 License

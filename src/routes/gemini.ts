@@ -23,8 +23,10 @@ import { getConfig } from "../config.js";
 import { getModelCatalog } from "../models/model-store.js";
 import {
   handleProxyRequest,
+  handleDirectRequest,
   type FormatAdapter,
 } from "./shared/proxy-handler.js";
+import type { UpstreamRouter } from "../proxy/upstream-router.js";
 
 function makeError(
   code: number,
@@ -77,6 +79,7 @@ export function createGeminiRoutes(
   accountPool: AccountPool,
   cookieJar?: CookieJar,
   proxyPool?: ProxyPool,
+  upstreamRouter?: UpstreamRouter,
 ): Hono {
   const app = new Hono();
 
@@ -104,8 +107,28 @@ export function createGeminiRoutes(
       action === "streamGenerateContent" ||
       c.req.query("alt") === "sse";
 
+    // Parse request
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      c.status(400);
+      return c.json(makeError(400, "Invalid JSON in request body"));
+    }
+    const validationResult = GeminiGenerateContentRequestSchema.safeParse(body);
+    if (!validationResult.success) {
+      c.status(400);
+      return c.json(
+        makeError(400, `Invalid request: ${validationResult.error.message}`),
+      );
+    }
+    const req = validationResult.data;
+
+    const routeMatch = upstreamRouter?.resolveMatch(geminiModel);
+    const allowUnauthenticated = routeMatch?.kind === "api-key" || routeMatch?.kind === "adapter";
+
     // Auth check
-    if (!accountPool.isAuthenticated()) {
+    if (!allowUnauthenticated && !accountPool.isAuthenticated()) {
       c.status(401);
       return c.json(
         makeError(401, "Not authenticated. Please login first at /"),
@@ -127,23 +150,6 @@ export function createGeminiRoutes(
       }
     }
 
-    // Parse request
-    let body: unknown;
-    try {
-      body = await c.req.json();
-    } catch {
-      c.status(400);
-      return c.json(makeError(400, "Invalid JSON in request body"));
-    }
-    const validationResult = GeminiGenerateContentRequestSchema.safeParse(body);
-    if (!validationResult.success) {
-      c.status(400);
-      return c.json(
-        makeError(400, `Invalid request: ${validationResult.error.message}`),
-      );
-    }
-    const req = validationResult.data;
-
     const { codexRequest, tupleSchema } = translateGeminiToCodexRequest(
       req,
       geminiModel,
@@ -153,19 +159,19 @@ export function createGeminiRoutes(
       `[Gemini] Model: ${geminiModel} → ${codexRequest.model}`,
     );
 
-    return handleProxyRequest(
-      c,
-      accountPool,
-      cookieJar,
-      {
-        codexRequest,
-        model: geminiModel,
-        isStreaming,
-        tupleSchema,
-      },
-      GEMINI_FORMAT,
-      proxyPool,
-    );
+    const proxyReq = {
+      codexRequest,
+      model: geminiModel,
+      isStreaming,
+      tupleSchema,
+    };
+
+    if (routeMatch?.kind === "api-key" || routeMatch?.kind === "adapter") {
+      const directReq = { ...proxyReq, codexRequest: { ...codexRequest, model: geminiModel } };
+      return handleDirectRequest(c, routeMatch.adapter, directReq, GEMINI_FORMAT);
+    }
+
+    return handleProxyRequest(c, accountPool, cookieJar, proxyReq, GEMINI_FORMAT, proxyPool);
   });
 
   // List available models (Gemini format)

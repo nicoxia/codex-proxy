@@ -6,12 +6,15 @@ public-desktop/
 data/
 public/
 docs/
-bin/
+bin/*
+!bin/README.md
 .env
 *.log
 .asar-out/
 tmp/
-.claude/settings.local.json
+.claude/
+native/target/
+native/codex-tls.linux-*.node
 
 # Maintenance scripts (private)
 scripts/build/full-update.ts
@@ -20,7 +23,6 @@ scripts/build/check-update.ts
 scripts/build/types.ts
 scripts/manual-test/
 scripts/cron-update.sh
-tests/
 config/extraction-patterns.yaml
 
 # Design / internal files

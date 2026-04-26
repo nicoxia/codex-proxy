@@ -16,8 +16,8 @@ export const ConfigSchema = z.object({
     chromium_version: z.string().default("136"),
   }),
   model: z.object({
-    default: z.string().default("gpt-5.2-codex"),
-    default_reasoning_effort: z.string().default("medium"),
+    default: z.string().default("gpt-5.4"),
+    default_reasoning_effort: z.string().nullable().default(null),
     default_service_tier: z.string().nullable().default(null),
     inject_desktop_context: z.boolean().default(false),
     suppress_desktop_directives: z.boolean().default(true),
@@ -31,6 +31,8 @@ export const ConfigSchema = z.object({
     max_concurrent_per_account: z.number().int().min(1).nullable().default(3),
     request_interval_ms: z.number().int().min(0).nullable().default(50),
     rotation_strategy: z.enum(ROTATION_STRATEGIES).default("least_used"),
+    /** Preferred plan-type ordering for account selection (e.g. ["plus","team","free"]). */
+    tier_priority: z.array(z.string()).nullable().default(null),
     rate_limit_backoff_seconds: z.number().min(1).default(60),
     oauth_client_id: z.string().default("app_EMoamEEZ73f0CkXaXp7hrann"),
     oauth_auth_endpoint: z.string().default("https://auth.openai.com/oauth/authorize"),
@@ -40,9 +42,16 @@ export const ConfigSchema = z.object({
     host: z.string().default("0.0.0.0"),
     port: z.number().min(1).max(65535).default(8080),
     proxy_api_key: z.string().nullable().default(null),
+    trust_proxy: z.boolean().default(false),
   }),
+  logs: z.object({
+    enabled: z.boolean().default(false),
+    capacity: z.number().int().min(1).default(2000),
+    capture_body: z.boolean().default(false),
+    llm_only: z.boolean().default(true),
+  }).default({}),
   session: z.object({
-    ttl_minutes: z.number().min(1).default(60),
+    ttl_minutes: z.number().min(1).default(1440),
     cleanup_interval_minutes: z.number().min(1).default(5),
   }),
   tls: z.object({
@@ -62,6 +71,37 @@ export const ConfigSchema = z.object({
     auto_update: z.boolean().default(true),
     auto_download: z.boolean().default(false),
   }).default({}),
+  ollama: z.object({
+    enabled: z.boolean().default(false),
+    host: z.string().default("127.0.0.1"),
+    port: z.number().min(1).max(65535).default(11434),
+    version: z.string().trim().min(1).max(64).default("0.18.3"),
+    disable_vision: z.boolean().default(false),
+  }).default({}),
+  /** Third-party API provider keys for multi-backend routing. */
+  providers: z.object({
+    openai: z.object({
+      api_key: z.string(),
+      base_url: z.string().default("https://api.openai.com/v1"),
+    }).optional(),
+    anthropic: z.object({
+      api_key: z.string(),
+    }).optional(),
+    gemini: z.object({
+      api_key: z.string(),
+    }).optional(),
+    /** OpenAI-compatible third-party providers (Groq, DeepSeek, Together, etc.). */
+    custom: z.record(
+      z.string(),
+      z.object({
+        api_key: z.string(),
+        base_url: z.string(),
+        models: z.array(z.string()).default([]),
+      }),
+    ).default({}),
+  }).default({}),
+  /** Explicit model → provider name routing table. */
+  model_routing: z.record(z.string(), z.string()).default({}),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;

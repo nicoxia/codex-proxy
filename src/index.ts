@@ -9,6 +9,9 @@ import { requestId } from "./middleware/request-id.js";
 import { logger } from "./middleware/logger.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { dashboardAuth } from "./middleware/dashboard-auth.js";
+import { logCapture } from "./middleware/log-capture.js";
+
+import type { UpstreamAdapter } from "./proxy/upstream-adapter.js";
 import { createAuthRoutes } from "./routes/auth.js";
 import { createAccountRoutes } from "./routes/accounts.js";
 import { createChatRoutes } from "./routes/chat.js";
@@ -32,7 +35,14 @@ import { UsageStatsStore } from "./auth/usage-stats.js";
 import { startSessionCleanup, stopSessionCleanup } from "./auth/dashboard-session.js";
 import { createDashboardAuthRoutes } from "./routes/dashboard-login.js";
 import { attachWebSocketServer } from "./ws/responses-ws.js";
-import type { WsServerHandle } from "./ws/responses-ws.js";
+import { UpstreamRouter } from "./proxy/upstream-router.js";
+import { OpenAIUpstream } from "./proxy/openai-upstream.js";
+import { AnthropicUpstream } from "./proxy/anthropic-upstream.js";
+import { GeminiUpstream } from "./proxy/gemini-upstream.js";
+import { ApiKeyPool } from "./auth/api-key-pool.js";
+import { createApiKeyRoutes } from "./routes/api-keys.js";
+import { createAdapterForEntry } from "./proxy/adapter-factory.js";
+import { startOllamaBridge, stopOllamaBridge } from "./ollama/server.js";
 
 export interface ServerHandle {
   close: () => Promise<void>;
@@ -42,6 +52,12 @@ export interface ServerHandle {
 export interface StartOptions {
   host?: string;
   port?: number;
+}
+
+function urlHostForLocalRequest(host: string): string {
+  if (host === "0.0.0.0" || host === "::") return "127.0.0.1";
+  if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
+  return host;
 }
 
 /**
@@ -74,6 +90,15 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   const proxyPool = new ProxyPool();
   refreshScheduler.setProxyPool(proxyPool);
 
+  // Reactive refresh: when upstream 401 marks an account expired, trigger immediate RT→AT refresh.
+  // Skip if the scheduler itself just marked it expired (permanent failure) — isRefreshing() is
+  // still true at that point because the callback fires synchronously inside doRefresh's try block.
+  accountPool.onExpired((id) => {
+    if (!refreshScheduler.isRefreshing(id)) {
+      refreshScheduler.triggerRefreshNow(id);
+    }
+  });
+
   // Create Hono app
   const app = new Hono();
 
@@ -82,14 +107,57 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   app.use("*", logger);
   app.use("*", errorHandler);
   app.use("*", dashboardAuth);
+  app.use("*", logCapture);
+
+  // Build upstream router from config
+  const cfg = getConfig();
+  const adapters = new Map<string, UpstreamAdapter>();
+  if (cfg.providers.openai) {
+    adapters.set(
+      "openai",
+      new OpenAIUpstream("openai", cfg.providers.openai.api_key, cfg.providers.openai.base_url),
+    );
+    console.log("[Init] OpenAI upstream configured");
+  }
+  if (cfg.providers.anthropic) {
+    adapters.set("anthropic", new AnthropicUpstream(cfg.providers.anthropic.api_key));
+    console.log("[Init] Anthropic upstream configured");
+  }
+  if (cfg.providers.gemini) {
+    adapters.set("gemini", new GeminiUpstream(cfg.providers.gemini.api_key));
+    console.log("[Init] Gemini upstream configured");
+  }
+  for (const [name, provider] of Object.entries(cfg.providers.custom)) {
+    adapters.set(name, new OpenAIUpstream(name, provider.api_key, provider.base_url));
+    console.log(`[Init] Custom upstream "${name}" configured (${provider.base_url})`);
+    for (const model of provider.models) {
+      if (!cfg.model_routing[model]) {
+        cfg.model_routing[model] = name;
+      }
+    }
+  }
+  // Initialize API key pool for runtime-managed third-party keys
+  const apiKeyPool = new ApiKeyPool();
+  const hasApiKeys = apiKeyPool.getAll().length > 0;
+
+  const upstreamRouter = (adapters.size > 0 || hasApiKeys)
+    ? new UpstreamRouter(adapters, cfg.model_routing, "codex")
+    : undefined;
+
+  // Attach API key pool to router for dynamic model resolution
+  if (upstreamRouter) {
+    upstreamRouter.setApiKeyPool(apiKeyPool, createAdapterForEntry);
+    if (hasApiKeys) console.log(`[Init] API key pool: ${apiKeyPool.getAll().length} key(s) loaded`);
+  }
 
   // Mount routes
   const authRoutes = createAuthRoutes(accountPool, refreshScheduler);
   const accountRoutes = createAccountRoutes(accountPool, refreshScheduler, cookieJar, proxyPool);
-  const chatRoutes = createChatRoutes(accountPool, cookieJar, proxyPool);
-  const messagesRoutes = createMessagesRoutes(accountPool, cookieJar, proxyPool);
-  const geminiRoutes = createGeminiRoutes(accountPool, cookieJar, proxyPool);
-  const responsesRoutes = createResponsesRoutes(accountPool, cookieJar, proxyPool);
+  const chatRoutes = createChatRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
+  const messagesRoutes = createMessagesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
+  const geminiRoutes = createGeminiRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
+  const responsesRoutes = createResponsesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
+  const apiKeyRoutes = createApiKeyRoutes(apiKeyPool);
   const proxyRoutes = createProxyRoutes(proxyPool, accountPool);
   const usageStats = new UsageStatsStore();
   usageStats.recoverBaseline(accountPool);
@@ -98,12 +166,13 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   app.route("/", createDashboardAuthRoutes());
   app.route("/", authRoutes);
   app.route("/", accountRoutes);
+  app.route("/", apiKeyRoutes);
   app.route("/", chatRoutes);
   app.route("/", messagesRoutes);
   app.route("/", geminiRoutes);
   app.route("/", responsesRoutes);
   app.route("/", proxyRoutes);
-  app.route("/", createModelRoutes());
+  app.route("/", createModelRoutes(apiKeyPool));
   app.route("/", webRoutes);
 
   // Start server
@@ -165,13 +234,15 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   // Resolve actual port (may differ from requested when port=0)
   const addr = server.address();
   const actualPort = (addr && typeof addr === "object") ? addr.port : port;
+  const upstreamBaseUrl = `http://${urlHostForLocalRequest(host)}:${actualPort}`;
+  await startOllamaBridge(getConfig(), { upstreamBaseUrl });
 
   // ── WebSocket server ──────────────────────────────────────────────
   // Attach WS endpoint for Codex CLI (after server starts and has address)
-  // Cast needed because serve() returns ServerType (http | http2), but we always use http
   const wsHandle = attachWebSocketServer(server as import("http").Server, accountPool, cookieJar, proxyPool);
 
-  const close = (): Promise<void> => {
+  const close = async (): Promise<void> => {
+    await stopOllamaBridge();
     return new Promise((resolve) => {
       wsHandle.close();
       server.close(() => {

@@ -7,10 +7,17 @@
  */
 
 import { Hono, type Context } from "hono";
+import type { StatusCode } from "hono/utils/http-status";
 import type { AccountPool } from "../auth/account-pool.js";
 import type { CookieJar } from "../proxy/cookie-jar.js";
 import type { ProxyPool } from "../proxy/proxy-pool.js";
-import type { CodexResponsesRequest, CodexInputItem, CodexApi } from "../proxy/codex-api.js";
+import { CodexApi, CodexApiError } from "../proxy/codex-api.js";
+import type { CodexResponsesRequest, CodexCompactRequest, CodexInputItem } from "../proxy/codex-api.js";
+import { enqueueLogEntry } from "../logs/entry.js";
+import { summarizeRequestForLog } from "../logs/request-summary.js";
+import { getRealClientIp } from "../utils/get-real-client-ip.js";
+import { randomUUID } from "crypto";
+import type { UpstreamAdapter } from "../proxy/upstream-adapter.js";
 import { getConfig } from "../config.js";
 import { prepareSchema } from "../translation/shared-utils.js";
 import { reconvertTupleValues } from "../translation/tuple-schema.js";
@@ -18,8 +25,15 @@ import { parseModelName, resolveModelId, getModelInfo, buildDisplayModelName } f
 import { EmptyResponseError } from "../translation/codex-event-extractor.js";
 import {
   handleProxyRequest,
+  handleDirectRequest,
+  staggerIfNeeded,
   type FormatAdapter,
 } from "./shared/proxy-handler.js";
+import type { UpstreamRouter } from "../proxy/upstream-router.js";
+import { acquireAccount, releaseAccount } from "./shared/account-acquisition.js";
+import { handleCodexApiError } from "./shared/proxy-error-handler.js";
+import { withRetry } from "../utils/retry.js";
+import { extractCodexError } from "../types/codex-events.js";
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -27,10 +41,33 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+function extractOutputTextFromItem(item: unknown): string {
+  if (!isRecord(item) || !Array.isArray(item.content)) return "";
+  const chunks: string[] = [];
+  for (const part of item.content) {
+    if (
+      isRecord(part) &&
+      (part.type === "output_text" || part.type === "text") &&
+      typeof part.text === "string"
+    ) {
+      chunks.push(part.text);
+    }
+  }
+  return chunks.join("");
+}
+
+function syncOutputTextFromOutput(response: Record<string, unknown>): void {
+  if (!Array.isArray(response.output)) return;
+  const outputText = (response.output as unknown[])
+    .map(extractOutputTextFromItem)
+    .join("");
+  if (outputText) response.output_text = outputText;
+}
+
 // ── Passthrough stream translator ──────────────────────────────────
 
 async function* streamPassthrough(
-  api: CodexApi,
+  api: UpstreamAdapter,
   response: Response,
   _model: string,
   onUsage: (u: { input_tokens: number; output_tokens: number }) => void,
@@ -73,7 +110,11 @@ async function* streamPassthrough(
           for (const item of resp.output as unknown[]) {
             if (isRecord(item) && Array.isArray(item.content)) {
               for (const part of item.content as unknown[]) {
-                if (isRecord(part) && part.type === "output_text" && typeof part.text === "string") {
+                if (
+                  isRecord(part) &&
+                  (part.type === "output_text" || part.type === "text") &&
+                  typeof part.text === "string"
+                ) {
                   try {
                     const parsed = JSON.parse(part.text) as unknown;
                     part.text = JSON.stringify(reconvertTupleValues(parsed, tupleSchema));
@@ -113,7 +154,7 @@ async function* streamPassthrough(
 // ── Passthrough collect translator ─────────────────────────────────
 
 export async function collectPassthrough(
-  api: CodexApi,
+  api: UpstreamAdapter,
   response: Response,
   _model: string,
   tupleSchema?: Record<string, unknown> | null,
@@ -125,6 +166,8 @@ export async function collectPassthrough(
   let finalResponse: unknown = null;
   let usage = { input_tokens: 0, output_tokens: 0 };
   let responseId: string | null = null;
+  const outputItems: unknown[] = [];
+  let textDeltas = "";
 
   try {
     for await (const raw of api.parseStream(response)) {
@@ -136,7 +179,32 @@ export async function collectPassthrough(
         if (resp && typeof resp.id === "string") responseId = resp.id;
       }
 
+      if (raw.event === "response.output_text.delta" && typeof data.delta === "string") {
+        textDeltas += data.delta;
+      }
+
+      if (raw.event === "response.output_item.done" && isRecord(data.item)) {
+        outputItems.push(data.item);
+      }
+
       if (raw.event === "response.completed" && resp) {
+        // Codex hosted search 经常完整流出 output_item.done/text delta，
+        // 但 completed.response.output 为空。这里用流式事件回填最终 JSON。
+        if (Array.isArray(resp.output) && resp.output.length === 0) {
+          if (outputItems.length > 0) {
+            resp.output = outputItems;
+          } else if (textDeltas) {
+            resp.output = [{
+              type: "message",
+              role: "assistant",
+              status: "completed",
+              content: [{ type: "output_text", text: textDeltas }],
+            }];
+          }
+        }
+        if (typeof resp.output_text !== "string" || !resp.output_text) {
+          syncOutputTextFromOutput(resp);
+        }
         finalResponse = resp;
         if (typeof resp.id === "string") responseId = resp.id;
         if (isRecord(resp.usage)) {
@@ -148,9 +216,9 @@ export async function collectPassthrough(
       }
 
       if (raw.event === "error" || raw.event === "response.failed") {
-        const err = isRecord(data.error) ? data.error : data;
+        const err = extractCodexError(data);
         throw new Error(
-          `Codex API error: ${typeof err.code === "string" ? err.code : "unknown"}: ${typeof err.message === "string" ? err.message : JSON.stringify(data)}`,
+          `Codex API error: ${err.code}: ${err.message}`,
         );
       }
     }
@@ -172,7 +240,11 @@ export async function collectPassthrough(
       for (const item of resp.output as unknown[]) {
         if (isRecord(item) && Array.isArray(item.content)) {
           for (const part of item.content as unknown[]) {
-            if (isRecord(part) && part.type === "output_text" && typeof part.text === "string") {
+            if (
+              isRecord(part) &&
+              (part.type === "output_text" || part.type === "text") &&
+              typeof part.text === "string"
+            ) {
               try {
                 const parsed = JSON.parse(part.text) as unknown;
                 part.text = JSON.stringify(reconvertTupleValues(parsed, tupleSchema));
@@ -183,6 +255,7 @@ export async function collectPassthrough(
           }
         }
       }
+      syncOutputTextFromOutput(resp);
     }
   }
 
@@ -224,51 +297,245 @@ const PASSTHROUGH_FORMAT: FormatAdapter = {
     collectPassthrough(api, response, model, tupleSchema),
 };
 
-// ── Route ──────────────────────────────────────────────────────────
+// ── Shared auth check ─────────────────────────────────────────────
 
-export function createResponsesRoutes(
+function checkAuth(
+  c: Context,
   accountPool: AccountPool,
-  cookieJar?: CookieJar,
-  proxyPool?: ProxyPool,
-): Hono {
-  const app = new Hono();
+  allowUnauthenticated: boolean = false,
+): Response | null {
+  if (!allowUnauthenticated && !accountPool.isAuthenticated()) {
+    c.status(401);
+    return c.json({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        code: "invalid_api_key",
+        message: "Not authenticated. Please login first at /",
+      },
+    });
+  }
 
-  const handler = (compact: boolean) => async (c: Context) => {
-    // Auth check
-    if (!accountPool.isAuthenticated()) {
+  const config = getConfig();
+  if (config.server.proxy_api_key) {
+    const authHeader = c.req.header("Authorization");
+    const providedKey = authHeader?.replace("Bearer ", "");
+    if (!providedKey || !accountPool.validateProxyApiKey(providedKey)) {
       c.status(401);
       return c.json({
         type: "error",
         error: {
           type: "invalid_request_error",
           code: "invalid_api_key",
-          message: "Not authenticated. Please login first at /",
+          message: "Invalid proxy API key",
         },
       });
     }
+  }
+  return null;
+}
 
-    // Optional proxy API key check
-    const config = getConfig();
-    if (config.server.proxy_api_key) {
-      const authHeader = c.req.header("Authorization");
-      const providedKey = authHeader?.replace("Bearer ", "");
-      if (!providedKey || !accountPool.validateProxyApiKey(providedKey)) {
-        c.status(401);
-        return c.json({
-          type: "error",
-          error: {
-            type: "invalid_request_error",
-            code: "invalid_api_key",
-            message: "Invalid proxy API key",
-          },
-        });
-      }
-    }
+function parseBody(c: Context, body: unknown): Record<string, unknown> | Response {
+  if (!isRecord(body)) {
+    c.status(400);
+    return c.json({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        code: "invalid_request",
+        message: "Request body must be a JSON object",
+      },
+    });
+  }
+  return body;
+}
 
-    // Parse request body
-    let body: unknown;
+function formatResponsesError(status: number, msg: string): unknown {
+  return {
+    type: "error",
+    error: {
+      type: "server_error",
+      code: "codex_api_error",
+      message: msg,
+    },
+  };
+}
+
+// ── Build CodexApi helper ─────────────────────────────────────────
+
+function buildCodexApi(
+  token: string,
+  accountId: string | null,
+  cookieJar: CookieJar | undefined,
+  entryId: string,
+  proxyPool?: ProxyPool,
+): CodexApi {
+  const proxyUrl = proxyPool?.resolveProxyUrl(entryId);
+  return new CodexApi(token, accountId, cookieJar, entryId, proxyUrl);
+}
+
+// ── Compact handler (non-streaming JSON proxy) ────────────────────
+
+async function handleCompact(
+  c: Context,
+  accountPool: AccountPool,
+  cookieJar: CookieJar | undefined,
+  proxyPool: ProxyPool | undefined,
+  body: Record<string, unknown>,
+  upstreamRouter?: UpstreamRouter,
+): Promise<Response> {
+  const rawModel = typeof body.model === "string" ? body.model : "codex";
+  const parsed = parseModelName(rawModel);
+  const modelId = resolveModelId(parsed.modelId);
+
+  // Build CodexCompactRequest — matches codex-rs CompactionInput
+  const compactRequest: CodexCompactRequest = {
+    model: modelId,
+    input: Array.isArray(body.input) ? (body.input as CodexInputItem[]) : [],
+    instructions: typeof body.instructions === "string" ? body.instructions : "",
+  };
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    compactRequest.tools = body.tools;
+  }
+  if (typeof body.parallel_tool_calls === "boolean") {
+    compactRequest.parallel_tool_calls = body.parallel_tool_calls;
+  }
+  if (isRecord(body.reasoning)) {
+    const r: Record<string, string> = {};
+    if (typeof body.reasoning.effort === "string") r.effort = body.reasoning.effort;
+    if (typeof body.reasoning.summary === "string") r.summary = body.reasoning.summary;
+    if (Object.keys(r).length > 0) compactRequest.reasoning = r;
+  }
+  if (
+    isRecord(body.text) &&
+    isRecord(body.text.format) &&
+    typeof body.text.format.type === "string"
+  ) {
+    compactRequest.text = {
+      format: {
+        type: body.text.format.type as "text" | "json_object" | "json_schema",
+        ...(typeof body.text.format.name === "string" ? { name: body.text.format.name } : {}),
+        ...(isRecord(body.text.format.schema) ? { schema: body.text.format.schema as Record<string, unknown> } : {}),
+        ...(typeof body.text.format.strict === "boolean" ? { strict: body.text.format.strict } : {}),
+      },
+    };
+  }
+
+  const compactRouteMatch = upstreamRouter?.resolveMatch(rawModel);
+  if (compactRouteMatch?.kind === "api-key" || compactRouteMatch?.kind === "adapter") {
+    const directReq = {
+      codexRequest: {
+        model: rawModel,
+        input: compactRequest.input,
+        instructions: compactRequest.instructions,
+        stream: true as const,
+        store: false as const,
+        ...(compactRequest.tools ? { tools: compactRequest.tools } : {}),
+        ...(compactRequest.parallel_tool_calls !== undefined
+          ? { parallel_tool_calls: compactRequest.parallel_tool_calls }
+          : {}),
+        ...(compactRequest.reasoning ? { reasoning: compactRequest.reasoning } : {}),
+        ...(compactRequest.text ? { text: compactRequest.text } : {}),
+      },
+      model: rawModel,
+      isStreaming: false,
+    };
+    return handleDirectRequest(c, compactRouteMatch.adapter, directReq, PASSTHROUGH_FORMAT);
+  }
+
+  // Acquire account
+  const TAG = "Compact";
+  const triedEntryIds: string[] = [];
+  const released = new Set<string>();
+
+  const acquired = acquireAccount(accountPool, modelId, undefined, TAG);
+  if (!acquired) {
+    c.status(503);
+    return c.json(formatResponsesError(503, "No available accounts. All accounts are expired or rate-limited."));
+  }
+
+  let entryId = acquired.entryId;
+  triedEntryIds.push(entryId);
+  let codexApi = buildCodexApi(acquired.token, acquired.accountId, cookieJar, entryId, proxyPool);
+
+  console.log(
+    `[${TAG}] Account ${entryId} | model=${modelId} | input_items=${compactRequest.input.length}`,
+  );
+
+  await staggerIfNeeded(acquired.prevSlotMs);
+
+  for (;;) {
     try {
-      body = await c.req.json();
+      const result = await withRetry(
+        () => codexApi.createCompactResponse(compactRequest, c.req.raw.signal),
+        { tag: TAG },
+      );
+
+      releaseAccount(accountPool, entryId, undefined, released);
+      return c.json(result);
+    } catch (err) {
+      if (!(err instanceof CodexApiError)) {
+        releaseAccount(accountPool, entryId, undefined, released);
+        throw err;
+      }
+
+      const decision = handleCodexApiError(
+        err, accountPool, entryId, modelId, TAG, false,
+      );
+
+      if (decision.action === "respond") {
+        releaseAccount(accountPool, entryId, undefined, released);
+        c.status(decision.status as StatusCode);
+        return c.json(formatResponsesError(decision.status, decision.message));
+      }
+
+      if (decision.releaseBeforeRetry) {
+        releaseAccount(accountPool, entryId, undefined, released);
+      }
+
+      const retry = acquireAccount(accountPool, modelId, triedEntryIds, TAG);
+      if (!retry) {
+        const status = decision.status as StatusCode;
+        c.status(status);
+        if (decision.useFormat429) {
+          return c.json({
+            type: "error",
+            error: {
+              type: "rate_limit_error",
+              code: "rate_limit_exceeded",
+              message: decision.message,
+            },
+          });
+        }
+        return c.json(formatResponsesError(status, decision.message));
+      }
+
+      entryId = retry.entryId;
+      triedEntryIds.push(entryId);
+      codexApi = buildCodexApi(retry.token, retry.accountId, cookieJar, entryId, proxyPool);
+      console.log(`[${TAG}] Fallback → account ${retry.entryId}`);
+      await staggerIfNeeded(retry.prevSlotMs);
+      continue;
+    }
+  }
+}
+
+// ── Route ──────────────────────────────────────────────────────────
+
+export function createResponsesRoutes(
+  accountPool: AccountPool,
+  cookieJar?: CookieJar,
+  proxyPool?: ProxyPool,
+  upstreamRouter?: UpstreamRouter,
+): Hono {
+  const app = new Hono();
+
+  // ── POST /v1/responses — streaming SSE passthrough ──
+
+  const responsesHandler = async (c: Context) => {
+    let rawBody: unknown;
+    try {
+      rawBody = await c.req.json();
     } catch {
       c.status(400);
       return c.json({
@@ -281,28 +548,21 @@ export function createResponsesRoutes(
       });
     }
 
-    if (!isRecord(body)) {
-      c.status(400);
-      return c.json({
-        type: "error",
-        error: {
-          type: "invalid_request_error",
-          code: "invalid_request",
-          message: "Request body must be a JSON object",
-        },
-      });
-    }
+    const body = parseBody(c, rawBody);
+    if (body instanceof Response) return body;
 
-    // Resolve model (suffix parsing extracts service_tier and reasoning_effort)
     const rawModel = typeof body.model === "string" ? body.model : "codex";
+    const routeMatch = upstreamRouter?.resolveMatch(rawModel);
+    const allowUnauthenticated = routeMatch?.kind === "api-key" || routeMatch?.kind === "adapter";
+    const authErr = checkAuth(c, accountPool, allowUnauthenticated);
+    if (authErr) return authErr;
+
+    const config = getConfig();
     const parsed = parseModelName(rawModel);
     const modelId = resolveModelId(parsed.modelId);
     const displayModel = buildDisplayModelName(parsed);
     const modelInfo = getModelInfo(modelId);
 
-    // Build CodexResponsesRequest
-    // Codex API only supports streaming — stream/store are always true/false.
-    // When client sends stream:false, the proxy collects SSE events and returns assembled JSON.
     const codexRequest: CodexResponsesRequest = {
       model: modelId,
       instructions: typeof body.instructions === "string" ? body.instructions : "",
@@ -311,30 +571,28 @@ export function createResponsesRoutes(
       store: false,
     };
 
-    // Compact uses HTTP SSE only (no WebSocket path for /responses/compact).
-    // Regular responses use WebSocket to enable previous_response_id and server-side storage.
-    if (!compact) {
-      codexRequest.useWebSocket = true;
-    }
+    codexRequest.useWebSocket = true;
     if (typeof body.previous_response_id === "string") {
       codexRequest.previous_response_id = body.previous_response_id;
     }
 
-    // Reasoning effort: explicit body > suffix > model default > config default
+    // Reasoning effort: explicit body > suffix > config default
     const effort =
       (isRecord(body.reasoning) && typeof body.reasoning.effort === "string"
         ? body.reasoning.effort
         : null) ??
       parsed.reasoningEffort ??
-      modelInfo?.defaultReasoningEffort ??
       config.model.default_reasoning_effort;
-    const summary =
-      isRecord(body.reasoning) && typeof body.reasoning.summary === "string"
-        ? body.reasoning.summary
-        : "auto";
-    codexRequest.reasoning = { summary, ...(effort ? { effort } : {}) };
+    const clientReasoningRecord = isRecord(body.reasoning) ? body.reasoning : null;
+    if (effort || clientReasoningRecord) {
+      const summary =
+        clientReasoningRecord && typeof clientReasoningRecord.summary === "string"
+          ? clientReasoningRecord.summary
+          : "auto";
+      codexRequest.reasoning = { summary, ...(effort ? { effort } : {}) };
+    }
 
-    // Service tier: explicit body > suffix > config default
+    // Service tier
     const serviceTier =
       (typeof body.service_tier === "string" ? body.service_tier : null) ??
       parsed.serviceTier ??
@@ -344,7 +602,6 @@ export function createResponsesRoutes(
       codexRequest.service_tier = serviceTier;
     }
 
-    // Pass through tools and tool_choice as-is
     if (Array.isArray(body.tools) && body.tools.length > 0) {
       codexRequest.tools = body.tools;
     }
@@ -352,7 +609,7 @@ export function createResponsesRoutes(
       codexRequest.tool_choice = body.tool_choice as CodexResponsesRequest["tool_choice"];
     }
 
-    // Pass through text format (JSON mode / structured outputs) as-is
+    // Text format (JSON mode / structured outputs)
     let tupleSchema: Record<string, unknown> | null = null;
     if (
       isRecord(body.text) &&
@@ -379,28 +636,83 @@ export function createResponsesRoutes(
       };
     }
 
-    if (compact) codexRequest.compact = true;
-
-    // Client can request non-streaming (collect mode), but upstream is always stream
     const clientWantsStream = body.stream !== false;
+    const proxyReq = {
+      codexRequest,
+      model: displayModel,
+      isStreaming: clientWantsStream,
+      tupleSchema,
+    };
 
-    return handleProxyRequest(
-      c,
-      accountPool,
-      cookieJar,
-      {
-        codexRequest,
-        model: displayModel,
-        isStreaming: clientWantsStream,
-        tupleSchema,
-      },
-      PASSTHROUGH_FORMAT,
-      proxyPool,
-    );
+    const requestId = c.get("requestId") ?? randomUUID().slice(0, 8);
+    enqueueLogEntry({
+      requestId,
+      direction: "ingress",
+      method: c.req.method,
+      path: c.req.path,
+      model: rawModel,
+      stream: clientWantsStream,
+      request: summarizeRequestForLog("responses", body, {
+        ip: getRealClientIp(c, getConfig()?.server?.trust_proxy ?? false),
+        headers: Object.fromEntries(c.req.raw.headers.entries()),
+      }),
+    });
+
+    if (routeMatch?.kind === "api-key" || routeMatch?.kind === "adapter") {
+      // Use raw model name so adapter's extractModelId can strip the provider prefix
+      const directReq = { ...proxyReq, codexRequest: { ...codexRequest, model: rawModel } };
+      return handleDirectRequest(c, routeMatch.adapter, directReq, PASSTHROUGH_FORMAT);
+    }
+
+    return handleProxyRequest(c, accountPool, cookieJar, proxyReq, PASSTHROUGH_FORMAT, proxyPool);
   };
 
-  app.post("/v1/responses", handler(false));
-  app.post("/v1/responses/compact", handler(true));
+  // ── POST /v1/responses/compact — non-streaming JSON proxy ──
+
+  const compactHandler = async (c: Context) => {
+    let rawBody: unknown;
+    try {
+      rawBody = await c.req.json();
+    } catch {
+      c.status(400);
+      return c.json({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          code: "invalid_json",
+          message: "Malformed JSON request body",
+        },
+      });
+    }
+
+    const body = parseBody(c, rawBody);
+    if (body instanceof Response) return body;
+
+    const rawModel = typeof body.model === "string" ? body.model : "codex";
+    const routeMatch = upstreamRouter?.resolveMatch(rawModel);
+    const allowUnauthenticated = routeMatch?.kind === "api-key" || routeMatch?.kind === "adapter";
+    const authErr = checkAuth(c, accountPool, allowUnauthenticated);
+    if (authErr) return authErr;
+
+    const requestId = c.get("requestId") ?? randomUUID().slice(0, 8);
+    enqueueLogEntry({
+      requestId,
+      direction: "ingress",
+      method: c.req.method,
+      path: c.req.path,
+      model: rawModel,
+      stream: false,
+      request: summarizeRequestForLog("responses", body, {
+        ip: getRealClientIp(c, getConfig()?.server?.trust_proxy ?? false),
+        headers: Object.fromEntries(c.req.raw.headers.entries()),
+      }),
+    });
+
+    return handleCompact(c, accountPool, cookieJar, proxyPool, body, upstreamRouter);
+  };
+
+  app.post("/v1/responses", responsesHandler);
+  app.post("/v1/responses/compact", compactHandler);
 
   return app;
 }

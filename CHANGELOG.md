@@ -10,6 +10,42 @@
 
 ### Added
 
+- `config/models.yaml`: `gpt-5.5` (Plus-only general-purpose chat) and `gpt-image-2` (Plus-only image-generation backend) entered the static catalog
+- `CodexModelInfo.outputModalities` optional field on the model catalog interface to flag image-gen models apart from chat models (`src/models/model-store.ts`, `BackendModelEntry.output_modalities` also added for backend passthrough). `/v1/models/catalog` defaults missing values to `["text"]` so API output matches the documented contract.
+- README 新增图像生成小节 + 模型表 Output 列；`API.md` / `API_CN.md` 补 `image_generation` 工具参数矩阵、事件流、编辑模式文档
+- Dashboard: new Logs tab to inspect ingress/egress requests, with enable/pause controls, filters, search, and details panel.
+- 控制台新增日志页面：支持启用/暂停、方向筛选、搜索与详情查看，便于排查请求流向。
+- `auth.tier_priority` 配置项：按 plan 类型排序账号选择优先级（如 `["plus", "pro", "team", "free"]`），高优先级 tier 的账号在有可用时始终优先选择；默认 `null`（不启用），与所有轮转策略兼容 (#348)
+
+- `server.trust_proxy` config option (default `false`): when enabled, the real client IP is read from `X-Forwarded-For` / `X-Real-IP` headers instead of the raw socket address. Required for users who expose codex-proxy via tunnel software (frp, ngrok, etc.) so that dashboard auth works correctly — previously all tunnel traffic appeared as `127.0.0.1` and bypassed authentication even when `proxy_api_key` was set (#350)
+
+### Fixed
+
+- 无可用账号时不再执行无意义的重试，直接返回描述性错误信息（含各状态账号计数：rate-limited / expired / banned / disabled）(#362)
+- API Key 路由（OpenAI/Anthropic/Gemini）上游返回错误时，透传原始 JSON 响应体，而非包装为代理自有格式；Codex 账号路由仍使用代理格式 (#367)
+
+- `least_used` 策略不再将 `window_reset_at = null` 的新账号（从未收到限速响应头）视为 Infinity 而永久排在已有窗口账号之后；现在两者都进入 `request_count` 比较，新账号（0 请求）可正确轮转到，`__cf_bm` cookie 也能正常写入 (#342)
+
+- 默认不再发送 `reasoning.effort`：移除 `modelInfo.defaultReasoningEffort` 自动兜底，`default_reasoning_effort` 默认改为 `null`，彻底消除简单对话触发 medium 推理导致的 token 暴涨；Dashboard 新增 "Disabled (no reasoning)" 选项，用户可按需开启
+
+- 上游 401 时立即触发 RT→AT 刷新，而非等待定时器（修复 token 被提前作废后账号一直显示 expired 的问题）
+- Dashboard session 滑动窗口续期：每次有效请求自动延长过期时间，不再固定 TTL 后断连
+- Dashboard 前端全局 401 拦截：session 过期后自动跳回登录页，不再卡死在空白页
+- Add Account 对话框新增 Cancel 按钮，OAuth 流程中可随时关闭对话框 (#319)
+- Electron 打包前清空旧 public/ 目录，防止残留旧版前端资源导致显示异常 (#320)
+
+### Changed
+
+- Default model switched from `gpt-5.3-codex` → `gpt-5.4` (`config/default.yaml`, `config/models.yaml.isDefault`, Zod schema default in `src/config-schema.ts`). Removed the `codex` alias — clients must use full model IDs. Sonnet mapping in Anthropic preset/README 推荐表保持 `gpt-5.3-codex` 不变（编程场景更贴位）
+- Static `isDefault` and `outputModalities` on `config/models.yaml` entries now survive the backend dynamic fetch merge (previously the spread of normalized `undefined`/`false` silently clobbered YAML-declared values)
+- Dashboard session 默认 TTL 从 1 小时延长至 24 小时
+
+### Added
+
+- 第三方 API Key 管理：支持 Anthropic / OpenAI / Gemini / OpenRouter 预设模型 + 自定义 provider，每个 key 绑定一个具体模型，运行时动态路由（优先于 config 固定 key），LRU 轮转多 key 负载均衡
+  - REST API：`GET/POST /auth/api-keys`、`GET /auth/api-keys/catalog`、`POST /auth/api-keys/import`、`GET /auth/api-keys/export`、批量删除、label/status 管理
+  - Dashboard 新增 API Keys tab：表单添加（御三家下拉选模型 / custom 手填）、import/export、toggle 启停、删除
+  - 持久化 `data/api-keys.json`，UpstreamRouter 优先级 0 匹配 pool entry
 - 加强伪装：Rust native transport（reqwest + rustls），TLS 指纹精确匹配真实 Codex Desktop；补齐 `x-openai-internal-codex-residency`、`x-client-request-id`、`x-codex-turn-state` 请求头
 - 账号探活：`POST /auth/accounts/health-check` 批量健康检查 + `POST /auth/accounts/:id/refresh` 单账号刷新，通过 OAuth refresh 探测存活状态，带 stagger 延迟和并发控制
 - Session affinity：同一对话链路由到同一账号，修复 `previous_response_id` 跨账号失效问题
@@ -78,7 +114,7 @@
 - Refresh-token-only 导入：批量导入现在支持只传 `refreshToken`（无需有效 JWT），后端自动用 RT 换取 AT 后添加账号
 - 导入模板下载：AccountImportExport 工具栏新增模板下载按钮，包含 token-only、RT-only、label 等示例格式
 - 导入支持 label 字段：批量导入时可为每条记录指定 label
-- Claude Code Setup 卡片：Dashboard 按 Opus/Sonnet/Haiku/自定义 层级一键复制环境变量（推荐模型 gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex）
+- Claude Code Setup 卡片：Dashboard 按 Opus/Sonnet/Haiku/自定义 层级一键复制环境变量（推荐模型 gpt-5.4 / gpt-5.3-codex / gpt-5.4-mini）
 - 账号启用/禁用 toggle：AccountCard 和 AccountTable 新增 per-account 开关，无需批量操作即可快速切换账号状态
 - Codex CLI 配置说明：README 新增 `~/.codex/config.toml` 配置示例
 - Token 刷新并发控制（`auth.refresh_concurrency`，默认 2）：多账号同时到期时限制并发数，避免上游限流

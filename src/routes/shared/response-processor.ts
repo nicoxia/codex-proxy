@@ -4,11 +4,9 @@
  * Encapsulates streaming (SSE) and non-streaming (collect) response paths.
  */
 
-import type { CodexApi } from "../../proxy/codex-api.js";
-import type { FormatAdapter } from "./proxy-handler.js";
+import type { UpstreamAdapter } from "../../proxy/upstream-adapter.js";
+import type { FormatAdapter, ResponseMetadata, UsageHint } from "./proxy-handler.js";
 import type { UsageInfo } from "../../translation/codex-event-extractor.js";
-
-export type { UsageInfo };
 
 /** Minimal subset of Hono's StreamingApi that we actually use. */
 export interface StreamWriter {
@@ -24,13 +22,15 @@ export interface StreamWriter {
  */
 export async function streamResponse(
   s: StreamWriter,
-  api: CodexApi,
+  api: UpstreamAdapter,
   rawResponse: Response,
   model: string,
   adapter: FormatAdapter,
   onUsage: (u: UsageInfo) => void,
   tupleSchema?: Record<string, unknown> | null,
   onResponseId?: (id: string) => void,
+  usageHint?: UsageHint,
+  onResponseMetadata?: (metadata: ResponseMetadata) => void,
 ): Promise<void> {
   try {
     for await (const chunk of adapter.streamTranslator(
@@ -40,6 +40,8 @@ export async function streamResponse(
       onUsage,
       onResponseId ?? (() => {}),
       tupleSchema,
+      usageHint,
+      onResponseMetadata,
     )) {
       try {
         await s.write(chunk);
@@ -58,4 +60,3 @@ export async function streamResponse(
     } catch { /* client already gone */ }
   }
 }
-

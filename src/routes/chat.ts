@@ -9,11 +9,21 @@ import {
   collectCodexResponse,
 } from "../translation/codex-to-openai.js";
 import { getConfig } from "../config.js";
-import { parseModelName, buildDisplayModelName } from "../models/model-store.js";
+import {
+  parseModelName,
+  buildDisplayModelName,
+  isRecognizedModelName,
+} from "../models/model-store.js";
+import { enqueueLogEntry } from "../logs/entry.js";
+import { getRealClientIp } from "../utils/get-real-client-ip.js";
+import { randomUUID } from "crypto";
 import {
   handleProxyRequest,
+  handleDirectRequest,
   type FormatAdapter,
 } from "./shared/proxy-handler.js";
+import type { UpstreamRouter } from "../proxy/upstream-router.js";
+import { summarizeRequestForLog } from "../logs/request-summary.js";
 
 function makeOpenAIFormat(wantReasoning: boolean): FormatAdapter {
   return {
@@ -51,48 +61,26 @@ function makeOpenAIFormat(wantReasoning: boolean): FormatAdapter {
   };
 }
 
+function formatModelNotFound(model: string) {
+  return {
+    error: {
+      message: `Model '${model}' not found`,
+      type: "invalid_request_error",
+      param: "model",
+      code: "model_not_found",
+    },
+  };
+}
+
 export function createChatRoutes(
   accountPool: AccountPool,
   cookieJar?: CookieJar,
   proxyPool?: ProxyPool,
+  upstreamRouter?: UpstreamRouter,
 ): Hono {
   const app = new Hono();
 
   app.post("/v1/chat/completions", async (c) => {
-    // Auth check
-    if (!accountPool.isAuthenticated()) {
-      c.status(401);
-      return c.json({
-        error: {
-          message: "Not authenticated. Please login first at /",
-          type: "invalid_request_error",
-          param: null,
-          code: "invalid_api_key",
-        },
-      });
-    }
-
-    // Optional proxy API key check
-    const config = getConfig();
-    if (config.server.proxy_api_key) {
-      const authHeader = c.req.header("Authorization");
-      const providedKey = authHeader?.replace("Bearer ", "");
-      if (
-        !providedKey ||
-        !accountPool.validateProxyApiKey(providedKey)
-      ) {
-        c.status(401);
-        return c.json({
-          error: {
-            message: "Invalid proxy API key",
-            type: "invalid_request_error",
-            param: null,
-            code: "invalid_api_key",
-          },
-        });
-      }
-    }
-
     // Parse request
     let body: unknown;
     try {
@@ -121,24 +109,85 @@ export function createChatRoutes(
       });
     }
     const req = parsed.data;
+    const routeMatch = upstreamRouter?.resolveMatch(req.model) ?? (isRecognizedModelName(req.model)
+      ? { kind: "codex" as const }
+      : { kind: "not-found" as const });
 
+    if (routeMatch.kind === "not-found") {
+      c.status(404);
+      return c.json(formatModelNotFound(req.model));
+    }
+
+    const wantReasoning = !!req.reasoning_effort;
+    const fmt = makeOpenAIFormat(wantReasoning);
     const { codexRequest, tupleSchema } = translateToCodexRequest(req);
     const displayModel = buildDisplayModelName(parseModelName(req.model));
-    const wantReasoning = !!req.reasoning_effort;
+    const proxyReq = {
+      codexRequest,
+      model: displayModel,
+      isStreaming: req.stream,
+      tupleSchema,
+    };
 
-    return handleProxyRequest(
-      c,
-      accountPool,
-      cookieJar,
-      {
-        codexRequest,
-        model: displayModel,
-        isStreaming: req.stream,
-        tupleSchema,
-      },
-      makeOpenAIFormat(wantReasoning),
-      proxyPool,
-    );
+    const requestId = c.get("requestId") ?? randomUUID().slice(0, 8);
+    enqueueLogEntry({
+      requestId,
+      direction: "ingress",
+      method: c.req.method,
+      path: c.req.path,
+      model: req.model,
+      stream: !!req.stream,
+      request: summarizeRequestForLog("chat", req, {
+        ip: getRealClientIp(c, getConfig()?.server?.trust_proxy ?? false),
+        headers: Object.fromEntries(c.req.raw.headers.entries()),
+      }),
+    });
+
+    if (routeMatch.kind === "api-key" || routeMatch.kind === "adapter") {
+      const directReq = {
+        ...proxyReq,
+        model: req.model,
+        codexRequest: { ...codexRequest, model: req.model },
+      };
+      return handleDirectRequest(c, routeMatch.adapter, directReq, fmt);
+    }
+
+    // Auth check for Codex route only
+    if (!accountPool.isAuthenticated()) {
+      c.status(401);
+      return c.json({
+        error: {
+          message: "Not authenticated. Please login first at /",
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_api_key",
+        },
+      });
+    }
+
+    const summary = accountPool.getPoolSummary();
+    if (summary.active === 0) {
+      return handleProxyRequest(c, accountPool, cookieJar, proxyReq, fmt, proxyPool);
+    }
+
+    const config = getConfig();
+    if (config.server.proxy_api_key) {
+      const authHeader = c.req.header("Authorization");
+      const providedKey = authHeader?.replace("Bearer ", "");
+      if (!providedKey || !accountPool.validateProxyApiKey(providedKey)) {
+        c.status(401);
+        return c.json({
+          error: {
+            message: "Invalid proxy API key",
+            type: "invalid_request_error",
+            param: null,
+            code: "invalid_api_key",
+          },
+        });
+      }
+    }
+
+    return handleProxyRequest(c, accountPool, cookieJar, proxyReq, fmt, proxyPool);
   });
 
   return app;

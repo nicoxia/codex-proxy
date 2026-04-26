@@ -16,7 +16,7 @@ export interface CodexResponsesRequest {
   /** Optional: tools available to the model */
   tools?: unknown[];
   /** Optional: tool choice strategy */
-  tool_choice?: string | { type: string; name: string };
+  tool_choice?: string | { type: string; name?: string };
   /** Optional: text output format (JSON mode / structured outputs) */
   text?: {
     format: {
@@ -36,8 +36,32 @@ export interface CodexResponsesRequest {
   useWebSocket?: boolean;
   /** Upstream turn-state token for sticky routing (not serialized to body). */
   turnState?: string;
-  /** When true, route to /codex/responses/compact instead of /codex/responses. */
-  compact?: boolean;
+}
+
+/**
+ * Request body for POST /codex/responses/compact (non-streaming JSON).
+ * Matches codex-rs CompactionInput — no stream/store fields.
+ */
+export interface CodexCompactRequest {
+  model: string;
+  input: CodexInputItem[];
+  instructions: string;
+  tools?: unknown[];
+  parallel_tool_calls?: boolean;
+  reasoning?: { effort?: string; summary?: string };
+  text?: {
+    format: {
+      type: "text" | "json_object" | "json_schema";
+      name?: string;
+      schema?: Record<string, unknown>;
+      strict?: boolean;
+    };
+  };
+}
+
+/** Response body from POST /codex/responses/compact. */
+export interface CodexCompactResponse {
+  output: unknown[];
 }
 
 /** Structured content part for multimodal Codex input. */
@@ -100,5 +124,22 @@ export class CodexApiError extends Error {
       detail = body;
     }
     super(`Codex API error (${status}): ${detail}`);
+  }
+}
+
+/** previous_response_id 只能通过 WebSocket 安全续链，失败后不能降级为 HTTP delta-only。 */
+export class PreviousResponseWebSocketError extends CodexApiError {
+  constructor(public readonly causeMessage: string) {
+    super(
+      0,
+      JSON.stringify({
+        error: {
+          message:
+            "WebSocket failed while using previous_response_id; HTTP SSE fallback would drop server-side history: " +
+            causeMessage,
+        },
+      }),
+    );
+    this.name = "PreviousResponseWebSocketError";
   }
 }
