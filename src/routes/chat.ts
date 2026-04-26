@@ -16,6 +16,7 @@ import {
 } from "../models/model-store.js";
 import { enqueueLogEntry } from "../logs/entry.js";
 import { getRealClientIp } from "../utils/get-real-client-ip.js";
+import { isTrustedLocalNetworkRequest } from "../utils/is-trusted-local-network.js";
 import { randomUUID } from "crypto";
 import {
   handleProxyRequest,
@@ -172,9 +173,11 @@ export function createChatRoutes(
 
     const config = getConfig();
     if (config.server.proxy_api_key) {
+      const remoteAddr = getRealClientIp(c, config.server.trust_proxy);
       const authHeader = c.req.header("Authorization");
-      const providedKey = authHeader?.replace("Bearer ", "");
-      if (!providedKey || !accountPool.validateProxyApiKey(providedKey)) {
+      const providedKey = authHeader?.replace("Bearer ", "").trim();
+      const effectiveKey = providedKey || (isTrustedLocalNetworkRequest(remoteAddr) ? config.server.proxy_api_key : undefined);
+      if (!effectiveKey || !accountPool.validateProxyApiKey(effectiveKey)) {
         c.status(401);
         return c.json({
           error: {
